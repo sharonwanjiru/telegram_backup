@@ -10,15 +10,6 @@ from telethon.errors import SessionPasswordNeededError
 import datetime
 import json
 import queue
-import sys
-import traceback
-
-# Error logging to file
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    with open("crash.log", "w") as f:
-        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
-
-sys.excepthook = global_exception_handler
 
 LAST_IDS_FILE = "last_ids.json"
 
@@ -27,11 +18,10 @@ class TelegramBackupApp:
         self.root = root
         self.root.title("Telegram Backup App")
 
-        # --- UI Layout ---
         tk.Label(root, text="API ID:").grid(row=0, column=0, sticky="e")
         tk.Label(root, text="API Hash:").grid(row=1, column=0, sticky="e")
         tk.Label(root, text="Phone Number:").grid(row=2, column=0, sticky="e")
-        tk.Label(root, text="Select Chat:").grid(row=3, column=0, sticky="e")
+        tk.Label(root, text="Select Chats:").grid(row=3, column=0, sticky="ne")
 
         self.api_id_entry = tk.Entry(root)
         self.api_hash_entry = tk.Entry(root)
@@ -41,14 +31,12 @@ class TelegramBackupApp:
         self.api_hash_entry.grid(row=1, column=1)
         self.phone_entry.grid(row=2, column=1)
 
-        self.chat_combo = ttk.Combobox(root, state="readonly")
-        self.chat_combo.grid(row=3, column=1)
+        # Multiple selection Listbox
+        self.chat_listbox = tk.Listbox(root, selectmode=tk.MULTIPLE, height=10, exportselection=False)
+        self.chat_listbox.grid(row=3, column=1, sticky="ew")
 
-        self.status_text = tk.Text(root, height=10, width=60)
+        self.status_text = tk.Text(root, height=15, width=70)
         self.status_text.grid(row=5, column=0, columnspan=3, pady=10)
-
-        self.progress = ttk.Progressbar(root, orient="horizontal", length=400, mode="determinate")
-        self.progress.grid(row=6, column=0, columnspan=3, pady=5)
 
         self.login_button = tk.Button(root, text="Login & Load Chats", command=self.login)
         self.start_button = tk.Button(root, text="Start Daily Backup", command=self.start_scheduler, state="disabled")
@@ -58,7 +46,6 @@ class TelegramBackupApp:
         self.start_button.grid(row=4, column=1)
         self.stop_button.grid(row=4, column=2)
 
-        # --- Async setup ---
         self.client = None
         self.scheduler_thread = None
         self.running = False
@@ -126,13 +113,17 @@ class TelegramBackupApp:
             self.log("✅ Logged in successfully.")
             dialogs = await self.client.get_dialogs()
             chat_names = sorted([d.name for d in dialogs if d.name])
-            self.chat_combo['values'] = chat_names
-            if chat_names:
-                self.chat_combo.current(0)
+            self.dialogs = dialogs
+            self.chat_listbox.delete(0, tk.END)
+            for name in chat_names:
+                self.chat_listbox.insert(tk.END, name)
             self.start_button.config(state="normal")
 
         except Exception as e:
             self.log(f"Login failed: {e}")
+
+    def get_selected_chats(self):
+        return [self.chat_listbox.get(i) for i in self.chat_listbox.curselection()]
 
     def load_last_ids(self):
         if os.path.exists(LAST_IDS_FILE):
@@ -145,78 +136,66 @@ class TelegramBackupApp:
             json.dump(data, f)
 
     def backup_job(self):
-        asyncio.run_coroutine_threadsafe(self.backup_chat(), self.loop)
+        asyncio.run_coroutine_threadsafe(self.backup_chats(), self.loop)
 
-    async def backup_chat(self):
-        chat_name = self.chat_combo.get()
-        if not chat_name:
-            self.log("No chat selected.")
+    async def backup_chats(self):
+        selected_chats = self.get_selected_chats()
+        if not selected_chats:
+            self.log("⚠️ No chats selected for backup.")
             return
 
-        self.log(f"Backing up chat: {chat_name}")
-        dialogs = await self.client.get_dialogs()
-        target = next((d.entity for d in dialogs if d.name == chat_name), None)
-        if not target:
-            self.log(f"Chat '{chat_name}' not found.")
-            return
-
-        folder_name = datetime.datetime.now().strftime("backup_%Y-%m-%d")
-        base_folder = os.path.join(os.getcwd(), folder_name, chat_name.replace(" ", "_"))
-        media_folder = os.path.join(base_folder, "media")
-        os.makedirs(media_folder, exist_ok=True)
-        text_file = os.path.join(base_folder, "messages.txt")
-
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
         last_ids = self.load_last_ids()
-        last_msg_id = last_ids.get(chat_name, 0)
+        total_texts = 0
+        total_media = 0
 
-        new_messages = await self.client.get_messages(target, min_id=last_msg_id, limit=200)
-        new_messages = list(reversed(new_messages))
+        for chat_name in selected_chats:
+            self.log(f"🔄 Backing up chat: {chat_name}")
+            target = next((d.entity for d in self.dialogs if d.name == chat_name), None)
+            if not target:
+                self.log(f"❌ Chat not found: {chat_name}")
+                continue
 
-        if not new_messages:
-            self.log("No new messages.")
-            return
+            folder = os.path.join(f"backup_{date_str}", chat_name.replace(" ", "_"))
+            os.makedirs(os.path.join(folder, "media"), exist_ok=True)
+            text_file = os.path.join(folder, "messages.html")
 
-        self.progress['maximum'] = len(new_messages)
-        self.progress['value'] = 0
+            last_msg_id = last_ids.get(chat_name, 0)
+            messages = await self.client.get_messages(target, min_id=last_msg_id, limit=200)
+            messages = list(reversed(messages))
 
-        media_download_tasks = []
+            if not messages:
+                self.log(f"✅ No new messages for {chat_name}.")
+                continue
 
-        with open(text_file, "a", encoding="utf-8") as f:
-            for i, msg in enumerate(new_messages, 1):
-                if msg.message:
-                    f.write(f"[{msg.date.strftime('%Y-%m-%d %H:%M')}] {msg.sender_id}: {msg.message}\n")
-                if msg.media:
-                    # Schedule media downloads concurrently
-                    coro = msg.download_media(file=media_folder)
-                    media_download_tasks.append(coro)
-                    # We'll log media path after download is done
-                f.write("\n")
-                # Update progress bar on UI thread
-                self.progress['value'] = i
-                self.status_text.update_idletasks()
-
-        if media_download_tasks:
-            self.log(f"Downloading {len(media_download_tasks)} media files concurrently...")
-            media_paths = await asyncio.gather(*media_download_tasks)
             with open(text_file, "a", encoding="utf-8") as f:
-                for path in media_paths:
-                    if path:
-                        f.write(f"[Media saved]: {path}\n")
+                for msg in messages:
+                    sender = msg.sender_id or "Unknown"
+                    timestamp = msg.date.strftime("%Y-%m-%d %H:%M")
+                    text = msg.message or ""
+                    media_html = ""
+                    if msg.media:
+                        media_path = await msg.download_media(file=os.path.join(folder, "media"))
+                        filename = os.path.basename(media_path)
+                        media_html = f'<br><img src="media/{filename}" width="200"><br>'
+                        total_media += 1
+                    f.write(f"<p><b>{sender}</b> [{timestamp}]: {text}{media_html}</p>\n")
 
-        last_ids[chat_name] = new_messages[-1].id
+            last_ids[chat_name] = messages[-1].id
+            total_texts += len(messages)
+            self.log(f"✅ {len(messages)} messages backed up from '{chat_name}'.")
+
         self.save_last_ids(last_ids)
-
-        self.log(f"✅ {len(new_messages)} messages backed up from '{chat_name}'.")
-        self.progress['value'] = 0
+        self.log(f"📦 Backup complete: {total_texts} messages, {total_media} media files saved.\n")
 
     def start_scheduler(self):
         if self.running:
-            self.log("Scheduler is already running.")
+            self.log("Scheduler already running.")
             return
         self.running = True
         schedule.clear()
-        schedule.every().day.at("12:35").do(self.backup_job)
-        self.log("📅 Daily backup scheduled for 12:20.")
+        schedule.every().day.at("15:50").do(self.backup_job)
+        self.log("⏰ Daily backup scheduled for 15:50.")
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.scheduler_thread = threading.Thread(target=self.run_schedule, daemon=True)
@@ -237,9 +216,4 @@ class TelegramBackupApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = TelegramBackupApp(root)
-
-    # Wait until async loop is running to avoid premature coroutine calls
-    while not app.loop.is_running():
-        time.sleep(0.1)
-
     root.mainloop()
